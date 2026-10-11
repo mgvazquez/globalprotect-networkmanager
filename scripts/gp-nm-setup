@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+#
+# Build a GlobalProtect VPN profile in NetworkManager, with a client
+# certificate. Asks for whatever it is not given, checks the certificate
+# before writing anything, and shows the exact nmcli command it will run.
+#
+#   gp-nm-setup                            ask for everything
+#   gp-nm-setup --portal vpn.example.com   ask for the rest
+#   gp-nm-setup --dry-run                  print the command, write nothing
+#
+# Run it once. After that the connection is ordinary nmcli:
+#   nmcli connection up "NAME" / nmcli connection down "NAME"
+set -uo pipefail
+
+NAME=""; PORTAL=""; GWPATH="gateway"; CERT=""; KEY=""
+REPORTED_OS="linux-64"; HIP="no"; DRYRUN=0; ASSUME=0
+
+# Single-quote for display, so the printed command can be pasted as-is.
+# printf %q is correct too but escapes every comma in vpn.data into noise.
+sq()   { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+die()  { printf '\033[31merror\033[0m  %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarn\033[0m   %s\n' "$*" >&2; }
+info() { printf '\033[32m•\033[0m %s\n' "$*"; }
+
+usage() {
+  sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+
+Options:
+  --name NAME           connection name in NetworkManager
+  --portal HOST         portal/gateway host name, no scheme and no path
+  --gateway-path PATH   login path; default "gateway", empty for the portal flow
+  --cert FILE           client certificate, PEM
+  --key FILE            private key, PEM (may be the same file as --cert)
+  --os VALUE            reported_os: linux-64 (default), linux, win, mac-intel
+  --hip                 send a HIP report (off by default)
+  --dry-run             print the nmcli command and exit
+  --yes                 do not ask for confirmation
+  -h, --help            this
+USAGE
+  exit 0
+}
+
+while (( $# )); do
+  case "$1" in
+    --name)         NAME=${2:-}; shift 2;;
+    --portal)       PORTAL=${2:-}; shift 2;;
+    --gateway-path) GWPATH=${2:-}; shift 2;;
+    --cert)         CERT=${2:-}; shift 2;;
+    --key)          KEY=${2:-}; shift 2;;
+    --os)           REPORTED_OS=${2:-}; shift 2;;
+    --hip)          HIP="yes"; shift;;
+    --dry-run)      DRYRUN=1; shift;;
+    --yes|-y)       ASSUME=1; shift;;
+    -h|--help)      usage;;
+    *)              die "unknown option: $1";;
+  esac
+done
+
+ask() {                       # ask VAR "prompt" "default"
+  local -n ref=$1
+  local prompt=$2 default=${3:-} reply
+  [[ -n $ref ]] && return 0
+  if [[ -n $default ]]; then
+    read -r -p "$prompt [$default]: " reply
+    ref=${reply:-$default}
+  else
+    read -r -p "$prompt: " reply
+    ref=$reply
+  fi
+}
+
+command -v nmcli >/dev/null || die "nmcli not found — see gp-nm-check"
+name_file=""
+for d in /usr/lib/NetworkManager/VPN /usr/lib64/NetworkManager/VPN /usr/libexec/NetworkManager/VPN; do
+  [[ -e "$d/nm-openconnect-service.name" ]] && name_file="$d/nm-openconnect-service.name" && break
+done
+[[ -n $name_file ]] || die "the openconnect plugin is not installed — run gp-nm-check"
+
+# ── What the profile needs ──────────────────────────────────────────────────
+printf '\033[1mGlobalProtect profile for NetworkManager\033[0m\n\n'
+
+ask NAME   "Connection name" "GlobalProtect"
+ask PORTAL "Portal host (e.g. vpn.example.com)"
+
+[[ -n $PORTAL ]] || die "a portal host is required"
+[[ $PORTAL == *://* ]] && die "give the host only, without https://"
+[[ $PORTAL == */* ]]   && die "give the host only; the login path goes in --gateway-path"
+
+ask CERT "Client certificate (PEM)"
+CERT=${CERT/#\~/$HOME}
+[[ -r $CERT ]] || die "cannot read the certificate: $CERT"
+CERT=$(readlink -f "$CERT")
+
+ask KEY "Private key (PEM, may be the same file)" "$CERT"
+KEY=${KEY/#\~/$HOME}
+[[ -r $KEY ]] || die "cannot read the key: $KEY"
+KEY=$(readlink -f "$KEY")
+
+# ── Check the certificate before writing anything ───────────────────────────
+#
+# A profile that looks right and fails at connect time is the expensive kind of
+# mistake, and every failure below is one somebody has actually hit.
+if command -v openssl >/dev/null 2>&1; then
+  printf '\n\033[1mCertificate\033[0m\n'
+
+  subject=$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null) \
+    || die "$CERT is not a PEM certificate"
+  printf '  %s\n' "${subject#subject=}"
+  printf '  issuer:  %s\n' "$(openssl x509 -in "$CERT" -noout -issuer 2>/dev/null | sed 's/^issuer=//')"
+  printf '  expires: %s\n' "$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+
+  openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1 \
+    || die "the certificate has already expired"
+  openssl x509 -in "$CERT" -noout -checkend 2592000 >/dev/null 2>&1 \
+    || warn "the certificate expires within 30 days"
+
+  # The gateway validates the whole chain. A leaf-only PEM is a common cause of
+  # "certificate rejected" when the portal accepted the same file happily.
+  chain=$(grep -c 'BEGIN CERTIFICATE' "$CERT" 2>/dev/null || echo 0)
+  if (( chain <= 1 )); then
+    warn "the PEM holds one certificate and no intermediates"
+    printf '         If the gateway rejects it, append the issuing chain.\n'
+  else
+    info "chain: $chain certificates"
+  fi
+
+  if grep -q 'ENCRYPTED' "$KEY" 2>/dev/null; then
+    warn "the private key is passphrase-protected"
+    printf '         You will be asked for the passphrase on every connect,\n'
+    printf '         on top of the portal password.\n'
+  else
+    # Only comparable when the key is readable without a passphrase.
+    cpub=$(openssl x509 -in "$CERT" -noout -pubkey 2>/dev/null)
+    kpub=$(openssl pkey -in "$KEY" -pubout 2>/dev/null)
+    if [[ -n $cpub && -n $kpub ]]; then
+      [[ $cpub == "$kpub" ]] && info "key matches the certificate" \
+                             || die "the key does not match the certificate"
+    fi
+  fi
+
+  perms=$(stat -c '%a' "$KEY" 2>/dev/null)
+  [[ $perms =~ ^[0-7]00$ ]] || warn "the key is readable beyond its owner (mode $perms) — chmod 600 it"
+fi
+
+# ── The connection ──────────────────────────────────────────────────────────
+#
+# GlobalProtect exposes a portal and a gateway on the same host. With the host
+# alone, openconnect treats it as the portal: it authenticates there, asks for
+# the gateway list, and authenticates again — two password prompts. The NM
+# plugin has no usergroup key, but openconnect(1) documents --usergroup=X as
+# identical to https://host/X, so the login path rides along in the gateway
+# field and the portal round trip disappears.
+GATEWAY="$PORTAL${GWPATH:+/$GWPATH}"
+
+# cookie, gateway, gwcert and resolve carry flags=2, NM_SETTING_SECRET_FLAG_NOT_SAVED.
+# They are the result of authenticating against the portal, not configuration,
+# so NetworkManager asks for them at every connect instead of storing them.
+VPN_DATA="protocol=gp,\
+gateway=$GATEWAY,\
+authtype=cert,\
+usercert=$CERT,\
+userkey=$KEY,\
+pem_passphrase_fsid=no,\
+enable_csd_trojan=$HIP,\
+disable_udp=no,\
+prevent_invalid_cert=no,\
+reported_os=$REPORTED_OS,\
+cookie-flags=2,gateway-flags=2,gwcert-flags=2,resolve-flags=2"
+
+# No connection.permissions on purpose. NetworkManager >= 1.58 refuses to
+# activate a private connection referencing certificates on disk unless the
+# plugin declares supports-safe-private-file-access=true, and no released
+# openconnect plugin does. System-wide, NM reads cert and key as root.
+cmd=(nmcli connection add
+     connection.id "$NAME"
+     connection.type vpn
+     connection.autoconnect no
+     vpn.service-type org.freedesktop.NetworkManager.openconnect
+     vpn.data "$VPN_DATA"
+     ipv4.method auto
+     ipv6.method auto)
+
+printf '\n\033[1mCommand\033[0m\n'
+printf '  nmcli connection add \\\n'
+printf '    connection.id %s \\\n' "$(sq "$NAME")"
+printf '    connection.type vpn \\\n'
+printf '    connection.autoconnect no \\\n'
+printf '    vpn.service-type org.freedesktop.NetworkManager.openconnect \\\n'
+printf '    vpn.data %s \\\n' "$(sq "$VPN_DATA")"
+printf '    ipv4.method auto ipv6.method auto\n'
+
+(( DRYRUN )) && exit 0
+
+if nmcli -g NAME connection show 2>/dev/null | grep -qxF "$NAME"; then
+  printf '\n'
+  warn "a connection named \"$NAME\" already exists"
+  if (( ! ASSUME )); then
+    read -r -p "Update its gateway, certificate and key? [y/N]: " reply
+    [[ ${reply,,} == y* ]] || { echo "nothing done"; exit 0; }
+  fi
+  nmcli connection modify "$NAME" \
+    +vpn.data "gateway=$GATEWAY" \
+    +vpn.data "usercert=$CERT" \
+    +vpn.data "userkey=$KEY" || die "could not update the connection"
+  info "updated: $NAME"
+else
+  if (( ! ASSUME )); then
+    printf '\n'
+    read -r -p "Create it? [Y/n]: " reply
+    [[ -z $reply || ${reply,,} == y* ]] || { echo "nothing done"; exit 0; }
+  fi
+  "${cmd[@]}" >/dev/null || die "could not create the connection"
+  info "created: $NAME"
+fi
+
+cat <<NEXT
+
+Next:
+  nmcli connection up $(sq "$NAME")
+
+The login window asks for your portal user and password. The certificate is
+read from the file; you are not asked for it.
+
+If the tunnel comes up but internal names do not resolve, the portal pushed no
+search domain. Scope its resolvers to your internal domain:
+  nmcli connection modify $(sq "$NAME") ipv4.dns-search internal.example.com
+NEXT

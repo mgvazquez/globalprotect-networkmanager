@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# Preflight for a GlobalProtect VPN profile in NetworkManager.
+#
+# Checks every piece the connection needs and says what is missing and how to
+# install it. Reads nothing, writes nothing, asks for no privileges.
+#
+#   gp-nm-check            check this machine
+#   gp-nm-check --quiet    only print problems
+set -uo pipefail
+
+QUIET=0
+[[ ${1:-} == --quiet || ${1:-} == -q ]] && QUIET=1
+
+fail=0; warn=0
+
+ok()   { (( QUIET )) || printf '  \033[32mok\033[0m    %s\n' "$*"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
+note() { printf '  \033[33mwarn\033[0m  %s\n' "$*"; warn=$((warn+1)); }
+hint() { printf '        %s\n' "$*"; }
+head_() { (( QUIET )) || printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# ── NetworkManager ──────────────────────────────────────────────────────────
+head_ "NetworkManager"
+
+if command -v nmcli >/dev/null 2>&1; then
+  nm_ver=$(nmcli --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  ok "nmcli $nm_ver"
+else
+  bad "nmcli not found"
+  hint "Arch:   sudo pacman -S networkmanager"
+  hint "Debian: sudo apt install network-manager"
+  hint "Fedora: sudo dnf install NetworkManager"
+fi
+
+# ── The openconnect VPN plugin, which is two halves ─────────────────────────
+#
+# The service half talks to NetworkManager and runs openconnect. The GUI half
+# is the auth dialog, and it is the piece people miss: without it a connection
+# needing a login has nothing to ask with. Several distros ship them as
+# separate packages.
+head_ "openconnect plugin for NetworkManager"
+
+name_file=""
+for d in /usr/lib/NetworkManager/VPN /usr/lib64/NetworkManager/VPN /usr/libexec/NetworkManager/VPN; do
+  [[ -e "$d/nm-openconnect-service.name" ]] && name_file="$d/nm-openconnect-service.name" && break
+done
+
+if [[ -n $name_file ]]; then
+  ok "service plugin: $name_file"
+
+  dialog=$(sed -n 's/^auth-dialog=//p' "$name_file" | head -1)
+  if [[ -n $dialog && -x $dialog ]]; then
+    ok "auth dialog: $dialog"
+  else
+    bad "auth dialog missing${dialog:+ (declared as $dialog)}"
+    hint "This is the GUI half. Without it nothing can ask for your password."
+    hint "Arch:   sudo pacman -S networkmanager-openconnect"
+    hint "Debian: sudo apt install network-manager-openconnect-gnome"
+    hint "Fedora: sudo dnf install NetworkManager-openconnect-gnome"
+  fi
+
+  # NetworkManager 1.58 refuses to activate a *private* connection — one with
+  # connection.permissions — that references certificates or keys on disk,
+  # unless the plugin declares it can read them safely. No released
+  # openconnect plugin declares it, which is why the profile this repo builds
+  # is deliberately system-wide.
+  if grep -q '^supports-safe-private-file-access=true' "$name_file"; then
+    ok "plugin declares supports-safe-private-file-access"
+  else
+    note "plugin does not declare supports-safe-private-file-access"
+    hint "Keep the profile system-wide: do NOT set connection.permissions."
+    hint "On NetworkManager >= 1.58 a per-user profile with a certificate"
+    hint "fails with \"the 'openconnect' plugin doesn't support private"
+    hint "connections\"."
+  fi
+else
+  bad "openconnect service plugin not found"
+  hint "Arch:   sudo pacman -S networkmanager-openconnect"
+  hint "Debian: sudo apt install network-manager-openconnect-gnome"
+  hint "Fedora: sudo dnf install NetworkManager-openconnect-gnome"
+fi
+
+# ── openconnect itself ──────────────────────────────────────────────────────
+head_ "openconnect"
+
+if command -v openconnect >/dev/null 2>&1; then
+  oc_ver=$(openconnect --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+' | head -1)
+  ok "openconnect ${oc_ver}"
+  # openconnect --help exits non-zero, and pipefail would turn a successful
+  # grep into a failed check. Capture first, match after.
+  oc_help=$(openconnect --help 2>&1 || true)
+  if grep -q -- '--protocol=gp' <<<"$oc_help"; then
+    ok "GlobalProtect protocol supported"
+  else
+    bad "this openconnect has no --protocol=gp (needs 8.00 or newer)"
+  fi
+else
+  bad "openconnect not found"
+  hint "Arch:   sudo pacman -S openconnect"
+  hint "Debian: sudo apt install openconnect"
+  hint "Fedora: sudo dnf install openconnect"
+fi
+
+# ── DNS ─────────────────────────────────────────────────────────────────────
+#
+# Split-tunnel GlobalProtect pushes internal resolvers. Whether they are
+# actually used depends on how NetworkManager hands DNS over.
+head_ "DNS"
+
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+  ok "systemd-resolved is running"
+else
+  note "systemd-resolved is not running"
+  hint "Not required, but it is how the tunnel's resolvers get scoped to the"
+  hint "internal domain instead of catching every query."
+fi
+
+if command -v NetworkManager >/dev/null 2>&1; then
+  dns_mode=$(NetworkManager --print-config 2>/dev/null |
+             sed -n 's/^dns=\(.*\)$/\1/p' | tail -1)
+  [[ -n $dns_mode ]] && ok "NetworkManager dns backend: $dns_mode"
+
+  # A [global-dns] section overrides the DNS of every connection, the VPN
+  # included, and NetworkManager.conf(5) says so plainly: it makes the
+  # per-connection servers "to be ignored". A machine configured this way
+  # brings the tunnel up with working routes and no internal name resolution.
+  # Only an active one matters. A section left with no servers is how the
+  # override gets neutralised, and that is a fixed machine, not a broken one.
+  if NetworkManager --print-config 2>/dev/null | awk '
+       /^\[global-dns/ { sect = 1; next }
+       /^\[/           { sect = 0 }
+       sect && /^servers=[^[:space:]]/ { found = 1 }
+       END { exit !found }'; then
+    note "an active [global-dns] section is configured"
+    hint "It overrides the DNS of every connection, including this VPN."
+    hint "Check which file sets it:"
+    hint "  grep -rl global-dns /etc/NetworkManager/conf.d/"
+  fi
+fi
+
+# ── Certificate tooling ─────────────────────────────────────────────────────
+head_ "certificate tooling"
+
+if command -v openssl >/dev/null 2>&1; then
+  ok "openssl $(openssl version | awk '{print $2}')"
+else
+  note "openssl not found — gp-nm-setup cannot validate your certificate"
+fi
+
+# ── Verdict ─────────────────────────────────────────────────────────────────
+printf '\n'
+if (( fail )); then
+  printf '\033[31m%d blocking problem(s)\033[0m, %d warning(s)\n' "$fail" "$warn"
+  exit 1
+fi
+printf '\033[32mready\033[0m%s\n' "$( (( warn )) && printf ' — with %d warning(s)' "$warn")"
