@@ -5,12 +5,18 @@ requires a **client certificate**, using NetworkManager rather than the vendor
 client — so the tunnel is managed like every other connection on the machine,
 needs no `sudo`, and hands its DNS to `systemd-resolved`.
 
-This covers the case the usual tooling does not. `gpclient` — the CLI of
-`globalprotect-openconnect`, which most desktop integrations wrap — has no
-option for a client certificate at all; as of 2.5.4 `gpclient connect --help`
-offers `--user`, `--passwd-on-stdin`, `--cookie-on-stdin`, `--browser` and
-`--hip`, and nothing else. If your portal wants a certificate, everything built
-on `gpclient` is out.
+There are two ways to do this on Linux, and this guide is about the second.
+`gpclient` — the CLI of `globalprotect-openconnect` — handles client
+certificates perfectly well (`-c`, `-k`, `-p`, plus `--as-gateway` to skip the
+portal round trip), and if you want the shortest path, use it. What it costs is
+a `sudo` password on every connect *and* every disconnect, no connection state
+beyond a PID file, no autoconnect, and a DNS default that sends every query —
+public names included — to your corporate resolvers.
+
+NetworkManager trades that for an administered tunnel: no admin password at
+all, DNS scoped to your internal domain, state and autoconnect like any other
+connection. It has one limitation `gpclient` does not — see
+[Limits](#limits) — so check that before committing to it.
 
 > **The certificate and the password are two independent factors, not
 > alternatives.** The certificate operates at the TLS layer of every HTTPS
@@ -29,20 +35,29 @@ on `gpclient` is out.
 
 ## Why NetworkManager
 
-The alternative is calling `openconnect` yourself, which works but leaves you
-owning the parts NetworkManager already solves:
+Measured against the same portal, with a certificate, on the same machine:
 
-| | by hand | NetworkManager |
+| | `gpclient` | NetworkManager |
 |---|---|---|
-| tunnel device | `sudo`, or a pre-created tun plus a narrow sudoers rule | created by NM as its own `nm-openconnect` user |
-| authorisation | `sudo` on every connect | polkit, already granted to local active sessions |
-| DNS | `vpnc-script` rewriting `/etc/resolv.conf` | handed to `systemd-resolved` over D-Bus, scoped per link |
-| split-tunnel routes | applied by `vpnc-script` | applied by NM, visible in `nmcli` |
-| disconnect | find and `SIGTERM` the right process, never `SIGKILL` | `nmcli connection down`, which logs out of the portal cleanly |
+| client certificate | `-c` / `-k` / `-p` | `usercert` / `userkey` |
+| certificate in the **tunnel** phase | **yes** | **no** — see [Limits](#limits) |
+| straight to the gateway | `--as-gateway` | `gateway=host/path` |
+| admin password | **one to connect, one to disconnect** | **none** |
+| portal password | one | one |
+| DNS to `systemd-resolved` | yes | yes |
+| DNS scoped to your domain | no — `~.`, every query goes to the VPN | yes, via `ipv4.dns-search` |
+| connection state | `/var/run/gpclient.lock` holds a PID | `nmcli`, by name |
+| autoconnect | no | NetworkManager's own flag |
 
-The cost is one real limitation, in [Limits](#limits): the certificate reaches
-the authentication phase but not the tunnel phase. For most portals that is
-fine. Check it before building anything on top.
+The DNS row is fixable on the `gpclient` side with a `vpnc-script` wrapper that
+sets `CISCO_SPLIT_DNS` and calls `resolvectl default-route <if> no`; its own
+script never issues the second call, so the link stays a default route and
+public queries race between it and your real one. The admin password is not
+fixable: `gpclient` needs root to make the tunnel, and even `gpclient
+disconnect` fails silently without it.
+
+So: `gpclient` if you want the shortest path and do not mind the password,
+NetworkManager if you want the tunnel administered like everything else.
 
 ## Dependencies
 
@@ -236,12 +251,26 @@ sends **every** query — public names included — to your corporate resolvers.
 nmcli connection modify 'Work VPN' ipv4.dns-search internal.example.com
 ```
 
+**List every internal domain, not just the obvious one.** Scoping is exact: a
+name under a domain you left out stops resolving. While the link is a default
+route this is invisible, because everything reaches the corporate resolvers
+anyway — so the breakage appears at the moment you fix the scoping, which makes
+it look like the fix caused it. Separate several with commas:
+
+```bash
+nmcli connection modify 'Work VPN' ipv4.dns-search 'corp.example.com,ad.example.com'
+```
+
 Reconnect, then confirm the split:
 
 ```
-$ resolvectl query intranet.internal.example.com   # -> link: <vpn iface>
-$ resolvectl query www.google.com                  # -> link: <wifi iface>
+$ resolvectl query intranet.corp.example.com   # -> link: <vpn iface>
+$ resolvectl query www.google.com              # -> link: <wifi iface>
 ```
+
+Run the public one a few times. With two links claiming the default route
+`systemd-resolved` queries both and keeps whichever answers first, so a single
+sample can look right by luck.
 
 ## What the settings mean
 
@@ -358,10 +387,22 @@ openconnect --protocol gp --servercert pin-sha256:... --cookie-on-stdin \
 ```
 
 If your gateway requires mutual TLS in the tunnel phase too, it will
-authenticate and then fail to connect. There is no setting that fixes this;
-you would need to call openconnect in two phases yourself, authenticating as
-your user and tunnelling as root, repeating `-c`/`-k` in both. Portals that
-require the certificate only to authenticate — the common case — work fine.
+authenticate and then fail to connect. There is no NetworkManager setting that
+fixes this.
+
+**`gpclient` does not have this limitation**, which is the one concrete reason
+to prefer it. Its log shows the certificate being installed for the tunnel
+phase as well:
+
+```
+INFO openconnect::ffi  Setting client certificate: /path/client.crt
+INFO openconnect::ffi  POST https://vpn.example.com/ssl-vpn/getconfig.esp
+INFO openconnect::ffi  Using client certificate 'name-from-the-cert'
+```
+
+So if your gateway wants the certificate in both phases, use `gpclient`.
+Portals that require it only to authenticate — the common case — work either
+way.
 
 **Every connect is a fresh login.** By design: the cookie is `NOT_SAVED`.
 Autoconnect at boot will not work for the same reason.
